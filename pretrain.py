@@ -66,8 +66,8 @@ CONFIG = {
     'use_flash_attn'        : True,
     'rel_rank'              : 8,
     # Training
-    'batch_size'            : 16,
-    'gradient_accumulation' : 4,
+    'batch_size'            : 64,
+    'gradient_accumulation' : 2,
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
     'weight_decay'          : 0.1,
