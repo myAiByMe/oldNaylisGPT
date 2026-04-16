@@ -10,6 +10,8 @@ import json
 import gc
 import traceback
 import argparse
+import threading
+import zipfile
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -20,7 +22,6 @@ from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from typing import Optional, List
-import threading
 
 torch.set_float32_matmul_precision('high')
 
@@ -40,37 +41,32 @@ def get_args():
     p.add_argument('--no-compile',   action='store_true')
     p.add_argument('--compile-mode', default='default',
                    choices=['default', 'reduce-overhead', 'max-autotune'])
-    p.add_argument('--HF', type=str, default=None,
-                   help='HuggingFace token (hf_xxx). Active la sync HF Hub.')
+    p.add_argument('--total-steps',  type=int, default=None,
+                   help='Forcer total_steps du scheduler WSD (reprise mid-training).')
+    p.add_argument('--HF_token',     type=str, default=None,
+                   help='Token Hugging Face (lecture/écriture). Ex: hf_xxxxxxxx')
     return p.parse_args()
 
 ARGS   = get_args()
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# ── HF Hub setup ─────────────────────────────────────────────────────────────
-HF_TOKEN       = ARGS.HF
-HF_DATA_REPO   = 'silyan/data_PoC'
-HF_MODEL_REPO  = 'silyan/oldnaylisGPT'
-HF_SYNC_EVERY  = 3600   # secondes — upload toutes les 1h
+# ── Hugging Face ──────────────────────────────────────────────────────────────
+HF_DATASET_REPO          = "silyan/data_PoC"       # lecture data
+HF_MODEL_REPO            = "silyan/testOldScript"  # écriture modèle + cache
+HF_TOKEN                 = ARGS.HF_token
+HF_TIMED_SAVE_EVERY_MIN  = 60
 
-if HF_TOKEN:
-    try:
-        from huggingface_hub import HfApi, hf_hub_download, snapshot_download
-        HF_API = HfApi(token=HF_TOKEN)
-        print(f'  HF Hub : activé  (repo modèle = {HF_MODEL_REPO})')
-    except ImportError:
-        print('  WARN : huggingface_hub non installé → pip install huggingface_hub')
-        HF_TOKEN = None
-        HF_API   = None
-else:
-    HF_API = None
-    print('  HF Hub : désactivé (pas de --HF token)')
+COMPILE_CACHE_DIR  = "./CompileCache"
+COMPILE_CACHE_ZIP  = "CompileCache.zip"
 
+if HF_TOKEN is None:
+    print('  ⚠️  Aucun token HF fourni (--HF_token). '
+          'Les repos privés et les pushs seront désactivés.')
 
 # ── Config ───────────────────────────────────────────────────────────────────
 CONFIG = {
     # Modèle
-    'vocab_size'            : None,           # rempli après tokenizer
+    'vocab_size'            : None,
     'embed_dim'             : 512,
     'num_heads'             : 8,
     'num_layers'            : 12,
@@ -87,7 +83,7 @@ CONFIG = {
     'use_flash_attn'        : True,
     'rel_rank'              : 8,
     # Training
-    'batch_size'            : 160,
+    'batch_size'            : 190,
     'gradient_accumulation' : 1,
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
@@ -101,7 +97,7 @@ CONFIG = {
     'warmup_ratio'          : 0.03,
     'decay_ratio'           : 0.15,
     'min_lr_ratio'          : 0.1,
-    # Validation
+    # Validation / Save
     'validate_every_steps'  : 500,
     'val_batches'           : 50,
     'save_every_steps'      : 2000,
@@ -124,111 +120,8 @@ if DEVICE == 'cuda':
     cap = torch.cuda.get_device_capability()
     print(f'  SM   : {cap[0]}{cap[1]}')
 print(f'  embed={CONFIG["embed_dim"]}  layers={CONFIG["num_layers"]}  '
-      f'heads={CONFIG["num_heads"]}  kv={CONFIG["n_kv_heads"]}  rel_rank={CONFIG["rel_rank"]}')
-
-
-# ── HF : télécharge chunk_000 depuis silyan/data_PoC ─────────────────────────
-def download_data_chunk():
-    """Télécharge chunk_000/tokens.npy depuis HF si absent localement."""
-    if not HF_TOKEN:
-        return
-    chunk_dir = os.path.join(CONFIG['data_dir'], 'chunk_000')
-    npy_path  = os.path.join(chunk_dir, 'tokens.npy')
-    if os.path.exists(npy_path):
-        print(f'  Data chunk_000 déjà présent — skip download')
-        return
-    os.makedirs(chunk_dir, exist_ok=True)
-    print(f'  Téléchargement chunk_000/tokens.npy depuis {HF_DATA_REPO}...')
-    try:
-        from huggingface_hub import hf_hub_download
-        local = hf_hub_download(
-            repo_id   = HF_DATA_REPO,
-            filename  = 'chunk_000/tokens.npy',
-            repo_type = 'dataset',
-            token     = HF_TOKEN,
-            local_dir = CONFIG['data_dir'],
-        )
-        print(f'  ✅ chunk_000 téléchargé → {local}')
-    except Exception as e:
-        print(f'  WARN : impossible de télécharger chunk_000 : {e}')
-
-
-# ── HF : télécharge le dossier Model si présent dans le repo ─────────────────
-def download_model_from_hf():
-    """Si le repo HF contient déjà un checkpoint, on le récupère localement."""
-    if not HF_TOKEN:
-        return
-    model_dir = os.path.dirname(CONFIG['checkpoint_file'])
-    os.makedirs(model_dir, exist_ok=True)
-    print(f'\n  Vérification checkpoint distant ({HF_MODEL_REPO})...')
-    try:
-        from huggingface_hub import list_repo_files
-        remote_files = list(list_repo_files(
-            repo_id   = HF_MODEL_REPO,
-            repo_type = 'dataset',
-            token     = HF_TOKEN,
-        ))
-        # On cherche le fichier .pt principal
-        pt_files = [f for f in remote_files if f.endswith('.pt')]
-        if not pt_files:
-            print('  Aucun checkpoint distant trouvé — démarrage from scratch')
-            return
-        print(f'  Fichiers distants trouvés : {pt_files}')
-        from huggingface_hub import hf_hub_download
-        for fname in remote_files:
-            # On télécharge tous les fichiers du dossier Model/
-            local_path = os.path.join(model_dir, os.path.basename(fname))
-            if os.path.exists(local_path):
-                continue
-            try:
-                hf_hub_download(
-                    repo_id   = HF_MODEL_REPO,
-                    filename  = fname,
-                    repo_type = 'dataset',
-                    token     = HF_TOKEN,
-                    local_dir = model_dir,
-                )
-                print(f'  ✅ {fname} téléchargé')
-            except Exception as e:
-                print(f'  WARN : impossible de télécharger {fname} : {e}')
-    except Exception as e:
-        print(f'  WARN : vérification HF échouée : {e}')
-
-
-# ── HF : upload le dossier Model/ (thread background) ────────────────────────
-_last_hf_upload: float = 0.0
-_hf_upload_lock        = threading.Lock()
-
-def upload_model_to_hf(force: bool = False):
-    """Upload ./Model/ vers HF Hub (non-bloquant via thread)."""
-    global _last_hf_upload
-    if not HF_TOKEN or HF_API is None:
-        return
-    now = time.time()
-    with _hf_upload_lock:
-        if not force and (now - _last_hf_upload) < HF_SYNC_EVERY:
-            return
-        _last_hf_upload = now
-
-    def _do_upload():
-        model_dir = os.path.dirname(CONFIG['checkpoint_file'])
-        if not os.path.exists(model_dir):
-            return
-        try:
-            print(f'\n  ☁️  Upload HF → {HF_MODEL_REPO} ...')
-            HF_API.upload_folder(
-                folder_path = model_dir,
-                repo_id     = HF_MODEL_REPO,
-                repo_type   = 'dataset',
-                commit_message = f'auto-sync step (background)',
-                token       = HF_TOKEN,
-            )
-            print(f'  ✅ Upload HF terminé')
-        except Exception as e:
-            print(f'  WARN : upload HF échoué : {e}')
-
-    t = threading.Thread(target=_do_upload, daemon=True)
-    t.start()
+      f'heads={CONFIG["num_heads"]}  kv={CONFIG["n_kv_heads"]}  rel_rank={CONFIG["rel_rank"]}  '
+      f'batch_size={CONFIG["batch_size"]}  grad_acc={CONFIG["gradient_accumulation"]}')
 
 
 # ── Tokenizer ────────────────────────────────────────────────────────────────
@@ -240,10 +133,193 @@ CONFIG['vocab_size'] = len(tokenizer)
 print(f'  vocab={len(tokenizer)}  eos={tokenizer.eos_token_id}')
 
 
-# ── Téléchargements HF au démarrage ──────────────────────────────────────────
-if HF_TOKEN:
-    download_data_chunk()
-    download_model_from_hf()
+# ── HF helpers ───────────────────────────────────────────────────────────────
+
+def hf_list_files(repo_id: str, repo_type: str = "dataset") -> list:
+    """Liste les fichiers d'un repo HF. Retourne [] si erreur."""
+    try:
+        from huggingface_hub import list_repo_files
+        return list(list_repo_files(repo_id=repo_id, repo_type=repo_type, token=HF_TOKEN))
+    except Exception as e:
+        print(f'  ⚠️  Impossible de lister {repo_id} : {e}')
+        return []
+
+
+def hf_check_and_download_data(data_dir: str):
+    """Si data_dir ne contient pas de chunks, télécharge depuis HF_DATASET_REPO."""
+    from huggingface_hub import snapshot_download
+    existing = [e for e in os.listdir(data_dir)
+                if os.path.isdir(os.path.join(data_dir, e)) and e.startswith('chunk')]
+    if existing:
+        print(f'  ✅ Data déjà présente : {len(existing)} chunk(s) dans {data_dir}')
+        return
+    print(f'\n{"="*70}')
+    print(f'  📥 DATA ABSENTE — téléchargement depuis {HF_DATASET_REPO}')
+    print(f'{"="*70}')
+    try:
+        snapshot_download(
+            repo_id        = HF_DATASET_REPO,
+            repo_type      = "dataset",
+            local_dir      = data_dir,
+            token          = HF_TOKEN,
+            ignore_patterns= ["*.md", "*.gitattributes"],
+        )
+        print(f'  ✅ Dataset téléchargé dans {data_dir}')
+    except Exception as e:
+        print(f'  ❌ Échec téléchargement dataset : {e}')
+        sys.exit(1)
+
+
+def hf_check_and_download_checkpoint(ckpt_path: str):
+    """Télécharge le checkpoint depuis HF_MODEL_REPO si absent localement."""
+    from huggingface_hub import hf_hub_download
+    ckpt_dir      = os.path.dirname(ckpt_path) or '.'
+    ckpt_filename = os.path.basename(ckpt_path)
+    info_filename = ckpt_filename.replace('.pt', '_info.json')
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    if os.path.exists(ckpt_path):
+        print(f'  ✅ Checkpoint local trouvé : {ckpt_path}')
+        return
+
+    print(f'  🔍 Checkpoint absent — recherche sur {HF_MODEL_REPO}...')
+    remote_files = hf_list_files(HF_MODEL_REPO)
+    for fname in (ckpt_filename, info_filename):
+        if fname not in remote_files:
+            print(f'  ℹ️  {fname} absent sur HF → nouveau training')
+            continue
+        try:
+            hf_hub_download(
+                repo_id   = HF_MODEL_REPO,
+                filename  = fname,
+                repo_type = "dataset",
+                token     = HF_TOKEN,
+                local_dir = ckpt_dir,
+            )
+            print(f'  ✅ {fname} téléchargé depuis HF')
+        except Exception as e:
+            print(f'  ⚠️  Échec download {fname} : {e}')
+
+
+def hf_download_compile_cache():
+    """
+    Télécharge CompileCache.zip depuis HF_MODEL_REPO et le dézippe localement.
+    Appelé une seule fois au démarrage.
+    """
+    from huggingface_hub import hf_hub_download
+    remote_files = hf_list_files(HF_MODEL_REPO)
+    if COMPILE_CACHE_ZIP not in remote_files:
+        print(f'  ℹ️  {COMPILE_CACHE_ZIP} absent sur HF → compilation from scratch')
+        return
+    print(f'  📥 Téléchargement {COMPILE_CACHE_ZIP} depuis {HF_MODEL_REPO}...')
+    try:
+        local_zip = hf_hub_download(
+            repo_id   = HF_MODEL_REPO,
+            filename  = COMPILE_CACHE_ZIP,
+            repo_type = "dataset",
+            token     = HF_TOKEN,
+            local_dir = ".",
+        )
+        with zipfile.ZipFile(local_zip, 'r') as zf:
+            zf.extractall(".")
+        print(f'  ✅ {COMPILE_CACHE_ZIP} dézippé → {COMPILE_CACHE_DIR}/')
+    except Exception as e:
+        print(f'  ⚠️  Échec download/unzip CompileCache : {e}')
+
+
+def _zip_compile_cache() -> Optional[str]:
+    """Zippe ./CompileCache/ → CompileCache.zip. Retourne le chemin ou None."""
+    if not os.path.isdir(COMPILE_CACHE_DIR):
+        return None
+    try:
+        with zipfile.ZipFile(COMPILE_CACHE_ZIP, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(COMPILE_CACHE_DIR):
+                for file in files:
+                    fp  = os.path.join(root, file)
+                    arc = os.path.relpath(fp, start=".")
+                    zf.write(fp, arc)
+        return COMPILE_CACHE_ZIP
+    except Exception as e:
+        print(f'  ⚠️  Erreur zip CompileCache : {e}')
+        return None
+
+
+def hf_push_checkpoint(ckpt_path: str, global_step: int, push_cache: bool = True):
+    """
+    Pousse le checkpoint + _info.json + CompileCache.zip vers HF_MODEL_REPO.
+    Appelé en thread daemon pour ne pas bloquer le training.
+    """
+    if HF_TOKEN is None:
+        return
+    from huggingface_hub import upload_file
+
+    ckpt_filename = os.path.basename(ckpt_path)
+    info_filename = ckpt_filename.replace('.pt', '_info.json')
+    info_path     = ckpt_path.replace('.pt', '_info.json')
+
+    files_to_push = [(ckpt_path, ckpt_filename)]
+    if os.path.exists(info_path):
+        files_to_push.append((info_path, info_filename))
+
+    # Zip du CompileCache
+    if push_cache:
+        zip_path = _zip_compile_cache()
+        if zip_path:
+            files_to_push.append((zip_path, COMPILE_CACHE_ZIP))
+
+    print(f'\n  ☁️  Push HF (step={global_step:,}) → {HF_MODEL_REPO}...')
+    for local_f, remote_f in files_to_push:
+        if not os.path.exists(local_f):
+            continue
+        try:
+            upload_file(
+                path_or_fileobj = local_f,
+                path_in_repo    = remote_f,
+                repo_id         = HF_MODEL_REPO,
+                repo_type       = "dataset",
+                token           = HF_TOKEN,
+                commit_message  = f"checkpoint step={global_step:,}",
+            )
+            print(f'  ✅ {remote_f} pushé')
+        except Exception as e:
+            print(f'  ⚠️  Push échoué pour {remote_f} : {e}')
+
+
+# ── Timed save state ─────────────────────────────────────────────────────────
+_timed_save_state = {
+    'last_save_time': time.time(),
+}
+
+def _should_timed_save() -> bool:
+    return (time.time() - _timed_save_state['last_save_time']) >= HF_TIMED_SAVE_EVERY_MIN * 60
+
+def _mark_timed_save_done():
+    _timed_save_state['last_save_time'] = time.time()
+
+def timed_hf_save(ckpt_mgr, model, optimizers, scheduler, metadata: dict):
+    """Sauvegarde locale + push HF si le timer est écoulé (thread daemon)."""
+    if not _should_timed_save():
+        return
+    print(f'\n  ⏱️  {HF_TIMED_SAVE_EVERY_MIN} min écoulées — sauvegarde + push HF...')
+    ckpt_mgr.save(model, optimizers, scheduler, metadata)
+    _mark_timed_save_done()
+    step = metadata.get('global_step', 0)
+    t = threading.Thread(
+        target=hf_push_checkpoint,
+        args=(ckpt_mgr.path, step, True),
+        daemon=True,
+    )
+    t.start()
+
+
+# ── Startup : data + checkpoint + compile cache ───────────────────────────────
+print('\n' + '=' * 70)
+print('  🔎 VÉRIFICATION DATA, CHECKPOINT & COMPILE CACHE')
+print('=' * 70)
+os.makedirs(CONFIG['data_dir'], exist_ok=True)
+hf_check_and_download_data(CONFIG['data_dir'])
+hf_check_and_download_checkpoint(CONFIG['checkpoint_file'])
+hf_download_compile_cache()
 
 
 # ── Chunk scan ───────────────────────────────────────────────────────────────
@@ -256,6 +332,8 @@ def scan_chunks(data_dir: str) -> list:
         if not os.path.isdir(chunk_dir) or not entry.startswith('chunk'):
             continue
         npy_file = os.path.join(chunk_dir, 'tokens.npy')
+        if not os.path.exists(npy_file):
+            npy_file = os.path.join(chunk_dir, 'cosmopedia.npy')
         if not os.path.exists(npy_file):
             continue
         try:
@@ -272,10 +350,9 @@ def scan_chunks(data_dir: str) -> list:
 ALL_CHUNKS = scan_chunks(CONFIG['data_dir'])
 if not ALL_CHUNKS:
     print(f'\nERREUR : aucun chunk dans {CONFIG["data_dir"]}')
-    print('  → Lancer dataset.py d\'abord ou vérifier le download HF')
     sys.exit(1)
 
-print(f'\n  {len(ALL_CHUNKS)} chunks détectés :')
+print(f'\n  {len(ALL_CHUNKS)} chunks disponibles :')
 for c in ALL_CHUNKS:
     print(f'    chunk_{c["id"]:03d} : {c["tokens"] / 1e9:.3f}B tokens')
 
@@ -287,8 +364,7 @@ def steps_for_chunk(n_tokens: int) -> int:
 
 
 TOTAL_STEPS = sum(steps_for_chunk(c['tokens']) for c in ALL_CHUNKS)
-print(f'  Total steps estimés : {TOTAL_STEPS:,}')
-print(f'  Stratégie : 1 passe par chunk, {len(ALL_CHUNKS)} chunk(s) au total')
+print(f'  Total steps estimés (tous chunks) : {TOTAL_STEPS:,}')
 
 
 # ── WSD Scheduler ────────────────────────────────────────────────────────────
@@ -444,17 +520,16 @@ class CheckpointManager:
             'scheduler_state_dict': scheduler.state_dict(),
         }
         info_path = self.path.replace('.pt', '_info.json')
-        info      = {**metadata, 'last_save': datetime.now().isoformat(), 'config': CONFIG}
-        tmp_json  = info_path + '.tmp'
+        info = {**metadata, 'last_save': datetime.now().isoformat(), 'config': CONFIG}
+        tmp_json = info_path + '.tmp'
         with open(tmp_json, 'w') as f:
             json.dump(info, f, indent=2, default=str)
         tmp_pt = self.path + '.tmp'
         torch.save(cp, tmp_pt)
         os.replace(tmp_pt, self.path)
         os.replace(tmp_json, info_path)
-        print(f'  💾 SAVE  step={metadata["global_step"]:,}  [{self.path}]')
-        # Tente un upload HF (non-bloquant, respecte le cooldown 1h)
-        upload_model_to_hf()
+        print(f'  💾 SAVE  step={metadata["global_step"]:,}  '
+              f'chunk_idx={metadata["current_chunk_idx"]}  [{self.path}]')
 
     def load(self) -> Optional[dict]:
         if not os.path.exists(self.path):
@@ -465,11 +540,21 @@ class CheckpointManager:
         if os.path.exists(info_path):
             with open(info_path, 'r') as f:
                 info = json.load(f)
-            for k in ('global_step', 'chunk_idx', 'total_training_time',
-                      'chunk_start_step'):
+            # Compatibilité ancien format (epoch/cwi) → nouveau format (chunk_idx)
+            if 'current_chunk_idx' not in info:
+                old_epoch        = info.get('current_epoch', 1)
+                old_cwi          = info.get('chunk_within_epoch', 0)
+                chunks_per_epoch = info.get('config', {}).get('chunks_per_epoch', 2)
+                reconstructed    = (old_epoch - 1) * chunks_per_epoch + old_cwi
+                info['current_chunk_idx'] = reconstructed
+                info['chunk_start_step']  = info.get('chunk_start_step', 0)
+                print(f'  ⚠️  Ancien format (epoch={old_epoch} cwi={old_cwi}) '
+                      f'→ chunk_idx={reconstructed}')
+            for k in ('global_step', 'current_chunk_idx',
+                      'total_training_time', 'chunk_start_step'):
                 cp[k] = info.get(k, 0)
         else:
-            cp.update({'global_step': 0, 'chunk_idx': 0,
+            cp.update({'global_step': 0, 'current_chunk_idx': 0,
                        'total_training_time': 0.0, 'chunk_start_step': 0})
         return cp
 
@@ -584,14 +669,13 @@ def train_one_chunk(
     ckpt_mgr: CheckpointManager, history: dict,
     global_step: int, total_time: float,
     chunk_idx: int, chunk_start_step: int,
+    is_resume: bool,
 ) -> tuple:
 
     muon_opt, adamw_opt = optimizers
-    steps_done   = global_step - chunk_start_step
-    batches_done = steps_done * CONFIG['gradient_accumulation']
 
     print(f'\n{"="*70}')
-    print(f'  Chunk {chunk_idx + 1}/{len(ALL_CHUNKS)} — chunk_{chunk_info["id"]:03d}  '
+    print(f'  Chunk {chunk_idx}/{len(ALL_CHUNKS)-1} — chunk_{chunk_info["id"]:03d}  '
           f'({chunk_info["tokens"] / 1e9:.2f}B tokens)')
     print(f'{"="*70}')
 
@@ -600,15 +684,22 @@ def train_one_chunk(
         CONFIG['max_seq_len'], CONFIG['use_packing'], tokenizer.eos_token_id)
     val_ds   = chunk.val_dataset(CONFIG['max_seq_len'])
 
-    total_seqs = len(train_ds)
-    if batches_done >= math.ceil(total_seqs / CONFIG['batch_size']):
-        print('  ✅ Chunk déjà traité — skip')
+    total_seqs            = len(train_ds)
+    steps_done_in_chunk   = global_step - chunk_start_step
+    batches_done_in_chunk = steps_done_in_chunk * CONFIG['gradient_accumulation']
+
+    if batches_done_in_chunk >= math.ceil(total_seqs / CONFIG['batch_size']):
+        print('  ✅ Chunk déjà traité intégralement — skip')
         chunk.unload()
         return global_step, total_time, chunk_start_step
 
-    rng     = np.random.default_rng(42 + chunk_idx)
+    rng     = np.random.default_rng(42 + chunk_idx * 1000)
     indices = rng.permutation(total_seqs)
-    indices = indices[batches_done * CONFIG['batch_size']:].tolist()
+    indices = indices[batches_done_in_chunk * CONFIG['batch_size']:].tolist()
+
+    if is_resume and batches_done_in_chunk > 0:
+        print(f'  ↩️  Reprise : {batches_done_in_chunk} batches déjà faits '
+              f'({steps_done_in_chunk} steps), {len(indices)} samples restants')
 
     class IndexSampler(torch.utils.data.Sampler):
         def __init__(self, idx): self._idx = idx
@@ -638,14 +729,16 @@ def train_one_chunk(
           f'packing={"ON" if CONFIG["use_packing"] else "OFF"}')
 
     model.train()
-    ae, adt       = (DEVICE == 'cuda'), torch.bfloat16
+    ae            = (DEVICE == 'cuda')
+    adt           = torch.bfloat16
     chunk_loss    = 0.0
     valid_batches = 0
     acc_steps     = 0
     t0            = time.time()
 
     pbar = tqdm(
-        train_loader, desc=f'  Chunk{chunk_idx}',
+        train_loader,
+        desc=f'  C{chunk_idx}',
         initial=total_batches - len(train_loader),
         total=total_batches, leave=True, dynamic_ncols=True,
     )
@@ -700,6 +793,7 @@ def train_one_chunk(
                     lr  =f'{lr:.2e}',
                 )
 
+                # Validation
                 if global_step % CONFIG['validate_every_steps'] == 0:
                     ppl, vloss = validate(model, val_loader, CONFIG['val_batches'])
                     pbar.write(f'  [val  step={global_step:,}] '
@@ -707,21 +801,33 @@ def train_one_chunk(
                     history.setdefault('validations', []).append({
                         'step': global_step, 'val_loss': vloss, 'val_ppl': ppl})
 
+                # Checkpoint périodique
                 if global_step % CONFIG['save_every_steps'] == 0:
                     ckpt_mgr.save(model, optimizers, scheduler, {
                         'global_step'        : global_step,
-                        'chunk_idx'          : chunk_idx,
-                        'total_training_time': total_time,
+                        'current_chunk_idx'  : chunk_idx,
+                        'total_training_time': total_time + (time.time() - t0),
                         'chunk_start_step'   : chunk_start_step,
                     })
 
+                # Timed save + push HF
+                timed_hf_save(ckpt_mgr, model, optimizers, scheduler, {
+                    'global_step'        : global_step,
+                    'current_chunk_idx'  : chunk_idx,
+                    'total_training_time': total_time + (time.time() - t0),
+                    'chunk_start_step'   : chunk_start_step,
+                })
+
+                # Affichage graph_scale (signal Naylis)
                 if global_step % 1000 == 0:
                     raw    = model._orig_mod if hasattr(model, '_orig_mod') else model
                     scales = [b.attention.graph_scale.detach().abs().mean().item()
                               for b in raw.blocks]
                     avg_s  = sum(scales) / len(scales)
+                    g_min  = min(scales); g_max = max(scales)
                     pbar.write(f'  [naylis step={global_step:,}] '
-                               f'|graph_scale| avg={avg_s:.5f}')
+                               f'|graph_scale| avg={avg_s:.5f}  '
+                               f'min={g_min:.5f}  max={g_max:.5f}')
 
         except torch.cuda.OutOfMemoryError:
             print(f'\n  OOM — skip batch')
@@ -742,11 +848,8 @@ def train_one_chunk(
           f'{elapsed / 60:.1f}min')
 
     history.setdefault('chunks', []).append({
-        'chunk_idx' : chunk_idx,
-        'chunk_id'  : chunk_info['id'],
-        'loss'      : avg_loss,
-        'time_sec'  : elapsed,
-        'global_step': global_step,
+        'chunk_idx': chunk_idx, 'chunk_id': chunk_info['id'],
+        'loss': avg_loss, 'time_sec': elapsed, 'global_step': global_step,
     })
 
     chunk.unload()
@@ -789,6 +892,7 @@ def main():
     print(f'  Params total : {p["total_M"]}M')
     print(f'  Naylis       : {p["naylis_K"]}K = {p["naylis_pct"]}')
 
+    # torch.compile
     if CONFIG['use_compile'] and DEVICE == 'cuda':
         print('\ntorch.compile...')
         import torch._dynamo
@@ -809,18 +913,22 @@ def main():
     )
     muon_opt, adamw_opt = optimizers
 
+    sched_total_steps = ARGS.total_steps if ARGS.total_steps is not None else TOTAL_STEPS
+    if ARGS.total_steps is not None:
+        print(f'\n  ⚠️  --total-steps forcé : {sched_total_steps:,} '
+              f'(calculé={TOTAL_STEPS:,})')
     scheduler = WSDScheduler(
         list(optimizers), max_lr=CONFIG['learning_rate'],
-        total_steps=TOTAL_STEPS, warmup_ratio=CONFIG['warmup_ratio'],
+        total_steps=sched_total_steps, warmup_ratio=CONFIG['warmup_ratio'],
         decay_ratio=CONFIG['decay_ratio'], min_lr_ratio=CONFIG['min_lr_ratio'],
     )
 
-    history          = {'config': CONFIG, 'chunks': [], 'validations': []}
-    global_step      = 0
-    start_chunk_idx  = 0
-    total_time       = 0.0
-    chunk_start_step = 0
-    cp               = None
+    history           = {'config': CONFIG, 'chunks': [], 'validations': []}
+    global_step       = 0
+    current_chunk_idx = 0
+    total_time        = 0.0
+    chunk_start_step  = 0
+    cp                = None
 
     cp = ckpt_mgr.load()
     if cp:
@@ -830,83 +938,100 @@ def main():
         muon_opt.load_state_dict(cp.get('muon_state_dict', {}))
         adamw_opt.load_state_dict(cp.get('adamw_state_dict', {}))
         scheduler.load_state_dict(cp.get('scheduler_state_dict', {}))
-        global_step      = cp.get('global_step', 0)
-        start_chunk_idx  = cp.get('chunk_idx', 0)
-        total_time       = cp.get('total_training_time', 0.0)
-        chunk_start_step = cp.get('chunk_start_step', 0)
+        global_step       = cp.get('global_step', 0)
+        current_chunk_idx = cp.get('current_chunk_idx', 0)
+        total_time        = cp.get('total_training_time', 0.0)
+        chunk_start_step  = cp.get('chunk_start_step', 0)
+        print(f'  global_step={global_step:,}  chunk_idx={current_chunk_idx}  '
+              f'total_time={total_time/3600:.2f}h')
 
-        # Si on reprend sur un chunk déjà terminé, passer au suivant
-        steps_done   = global_step - chunk_start_step
-        batches_done = steps_done * CONFIG['gradient_accumulation']
-        chunk_info   = ALL_CHUNKS[start_chunk_idx]
-        total_seqs   = (chunk_info['tokens'] // (CONFIG['max_seq_len'] + 1))
-        if batches_done >= math.ceil(total_seqs / CONFIG['batch_size']):
-            start_chunk_idx += 1
-            chunk_start_step = global_step
-
-        if start_chunk_idx >= len(ALL_CHUNKS):
-            print('✅ Training déjà terminé.')
+        if current_chunk_idx >= len(ALL_CHUNKS):
+            print('\n✅ Training déjà terminé sur tous les chunks disponibles.')
             return
 
     print('\n' + '=' * 70)
-    print(f'  TRAINING START — {TOTAL_STEPS:,} steps sur {len(ALL_CHUNKS)} chunks')
+    print(f'  TRAINING START — {TOTAL_STEPS:,} steps estimés — {len(ALL_CHUNKS)} chunks')
     print('=' * 70)
 
-    for chunk_idx in range(start_chunk_idx, len(ALL_CHUNKS)):
-        chunk_info = ALL_CHUNKS[chunk_idx]
-        is_resume  = (cp is not None and chunk_idx == start_chunk_idx)
-        if not is_resume:
-            chunk_start_step = global_step
+    # ── Boucle linéaire sur les chunks ───────────────────────────────────────
+    for chunk_idx, chunk_info in enumerate(ALL_CHUNKS):
+
+        if chunk_idx < current_chunk_idx:
+            print(f'  ⏩ chunk_{chunk_info["id"]:03d} (idx={chunk_idx}) — déjà traité, skip')
+            continue
+
+        is_resume        = (cp is not None and chunk_idx == current_chunk_idx)
+        chunk_start_step = chunk_start_step if is_resume else global_step
 
         try:
             global_step, total_time, chunk_start_step = train_one_chunk(
-                model=model, chunk_info=chunk_info, optimizers=optimizers,
-                scheduler=scheduler, ckpt_mgr=ckpt_mgr, history=history,
-                global_step=global_step, total_time=total_time,
-                chunk_idx=chunk_idx, chunk_start_step=chunk_start_step,
+                model            = model,
+                chunk_info       = chunk_info,
+                optimizers       = optimizers,
+                scheduler        = scheduler,
+                ckpt_mgr         = ckpt_mgr,
+                history          = history,
+                global_step      = global_step,
+                total_time       = total_time,
+                chunk_idx        = chunk_idx,
+                chunk_start_step = chunk_start_step,
+                is_resume        = is_resume,
             )
-            cp = None   # reprises suivantes ne sont plus le checkpoint initial
-
-        except KeyboardInterrupt:
-            print('\n  CTRL+C — sauvegarde...')
+            # Chunk terminé → save + avancer l'index
+            current_chunk_idx = chunk_idx + 1
             ckpt_mgr.save(model, optimizers, scheduler, {
                 'global_step'        : global_step,
-                'chunk_idx'          : chunk_idx,
+                'current_chunk_idx'  : current_chunk_idx,
+                'total_training_time': total_time,
+                'chunk_start_step'   : global_step,
+            })
+            cp = None
+
+        except KeyboardInterrupt:
+            print('\n  CTRL+C — sauvegarde d\'urgence...')
+            ckpt_mgr.save(model, optimizers, scheduler, {
+                'global_step'        : global_step,
+                'current_chunk_idx'  : chunk_idx,
                 'total_training_time': total_time,
                 'chunk_start_step'   : chunk_start_step,
             })
-            upload_model_to_hf(force=True)
+            print('  ✅ Sauvegarde OK')
+            print('  ☁️  Push HF urgence...')
+            hf_push_checkpoint(CONFIG['checkpoint_file'], global_step, push_cache=True)
             return
 
         except Exception:
             print(f'\n  ERREUR :\n{traceback.format_exc()}')
             ckpt_mgr.save(model, optimizers, scheduler, {
                 'global_step'        : global_step,
-                'chunk_idx'          : chunk_idx,
+                'current_chunk_idx'  : chunk_idx,
                 'total_training_time': total_time,
                 'chunk_start_step'   : chunk_start_step,
             })
-            upload_model_to_hf(force=True)
             raise
 
     # ── Fin du training ───────────────────────────────────────────────────────
-    print(f'\n{"="*70}\n  TRAINING TERMINÉ\n{"="*70}')
-    print(f'  Steps : {global_step:,}  |  Temps : {total_time / 3600:.2f}h')
+    print(f'\n{"="*70}')
+    print(f'  ✅ TRAINING TERMINÉ — tous les chunks traités')
+    print(f'{"="*70}')
+    print(f'  Steps  : {global_step:,}')
+    print(f'  Temps  : {total_time / 3600:.2f}h')
+    print(f'  Chunks : {len(ALL_CHUNKS)}')
 
     ckpt_mgr.save(model, optimizers, scheduler, {
         'global_step'        : global_step,
-        'chunk_idx'          : len(ALL_CHUNKS),
+        'current_chunk_idx'  : len(ALL_CHUNKS),
         'total_training_time': total_time,
         'chunk_start_step'   : global_step,
     })
-
-    # Upload final forcé
-    upload_model_to_hf(force=True)
 
     hist_path = CONFIG['checkpoint_file'].replace('.pt', '_history.json')
     with open(hist_path, 'w') as f:
         json.dump(history, f, indent=2, default=str)
     print(f'  History : {hist_path}')
+
+    print('\n  ☁️  Push final sur HF...')
+    hf_push_checkpoint(CONFIG['checkpoint_file'], global_step, push_cache=True)
     print('  DONE')
 
 
