@@ -87,7 +87,7 @@ CONFIG = {
     'use_flash_attn'        : True,
     'rel_rank'              : 8,
     # Training
-    'batch_size'            : 190,
+    'batch_size'            : 128,
     'gradient_accumulation' : 1,
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
@@ -165,7 +165,7 @@ def download_model_from_hf():
         from huggingface_hub import list_repo_files
         remote_files = list(list_repo_files(
             repo_id   = HF_MODEL_REPO,
-            repo_type = 'dataset',
+            repo_type = 'model',
             token     = HF_TOKEN,
         ))
         # On cherche le fichier .pt principal
@@ -176,23 +176,17 @@ def download_model_from_hf():
         print(f'  Fichiers distants trouvés : {pt_files}')
         from huggingface_hub import hf_hub_download
         for fname in remote_files:
-            # CompileCache/ → on restore dans ./ pour réutiliser le cache inductor
-            if fname.startswith('CompileCache/'):
-                local_path = os.path.join('.', fname)
-                dest_dir   = '.'
-            else:
-                # Tous les autres fichiers (Model/) → dossier checkpoint
-                local_path = os.path.join(model_dir, os.path.basename(fname))
-                dest_dir   = model_dir
+            # On télécharge tous les fichiers du dossier Model/
+            local_path = os.path.join(model_dir, os.path.basename(fname))
             if os.path.exists(local_path):
                 continue
             try:
                 hf_hub_download(
                     repo_id   = HF_MODEL_REPO,
                     filename  = fname,
-                    repo_type = 'dataset',
+                    repo_type = 'model',
                     token     = HF_TOKEN,
-                    local_dir = dest_dir,
+                    local_dir = model_dir,
                 )
                 print(f'  ✅ {fname} téléchargé')
             except Exception as e:
@@ -217,32 +211,19 @@ def upload_model_to_hf(force: bool = False):
         _last_hf_upload = now
 
     def _do_upload():
-        model_dir    = os.path.dirname(CONFIG['checkpoint_file'])
-        compile_dir  = './CompileCache'
+        model_dir = os.path.dirname(CONFIG['checkpoint_file'])
         if not os.path.exists(model_dir):
             return
         try:
-            print(f'\n  ☁️  Upload HF → {HF_MODEL_REPO} (Model + CompileCache)...')
+            print(f'\n  ☁️  Upload HF → {HF_MODEL_REPO} ...')
             HF_API.upload_folder(
-                folder_path    = model_dir,
-                repo_id        = HF_MODEL_REPO,
-                repo_type = 'dataset',
-                path_in_repo   = 'Model',
-                commit_message = 'auto-sync step (background)',
-                token          = HF_TOKEN,
+                folder_path = model_dir,
+                repo_id     = HF_MODEL_REPO,
+                repo_type   = 'model',
+                commit_message = f'auto-sync step (background)',
+                token       = HF_TOKEN,
             )
-            if os.path.exists(compile_dir) and os.listdir(compile_dir):
-                HF_API.upload_folder(
-                    folder_path    = compile_dir,
-                    repo_id        = HF_MODEL_REPO,
-                    repo_type = 'dataset',
-                    path_in_repo   = 'CompileCache',
-                    commit_message = 'auto-sync CompileCache (background)',
-                    token          = HF_TOKEN,
-                )
-                print(f'  ✅ Upload HF terminé (Model + CompileCache)')
-            else:
-                print(f'  ✅ Upload HF terminé (Model)')
+            print(f'  ✅ Upload HF terminé')
         except Exception as e:
             print(f'  WARN : upload HF échoué : {e}')
 
