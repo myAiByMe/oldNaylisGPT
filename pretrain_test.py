@@ -87,7 +87,7 @@ CONFIG = {
     'use_flash_attn'        : True,
     'rel_rank'              : 8,
     # Training
-    'batch_size'            : 128,
+    'batch_size'            : 160,
     'gradient_accumulation' : 1,
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
@@ -165,7 +165,7 @@ def download_model_from_hf():
         from huggingface_hub import list_repo_files
         remote_files = list(list_repo_files(
             repo_id   = HF_MODEL_REPO,
-            repo_type = 'model',
+            repo_type = 'dataset',
             token     = HF_TOKEN,
         ))
         # On cherche le fichier .pt principal
@@ -184,7 +184,7 @@ def download_model_from_hf():
                 hf_hub_download(
                     repo_id   = HF_MODEL_REPO,
                     filename  = fname,
-                    repo_type = 'model',
+                    repo_type = 'dataset',
                     token     = HF_TOKEN,
                     local_dir = model_dir,
                 )
@@ -219,7 +219,7 @@ def upload_model_to_hf(force: bool = False):
             HF_API.upload_folder(
                 folder_path = model_dir,
                 repo_id     = HF_MODEL_REPO,
-                repo_type   = 'model',
+                repo_type   = 'dataset',
                 commit_message = f'auto-sync step (background)',
                 token       = HF_TOKEN,
             )
