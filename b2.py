@@ -556,7 +556,6 @@ def main():
         "mode"            : args.mode,
         "model"           : args.model,
         "max_seq_len"     : MODEL_CFG["max_seq_len"],
-        "use_graph"       : MODEL_CFG["use_graph"],
         "tasks"           : task_keys,
         "shots"           : shots,
         "results"         : {k: round(v * 100, 2) for k, v in scores.items()},
