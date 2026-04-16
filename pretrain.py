@@ -66,8 +66,8 @@ CONFIG = {
     'use_flash_attn'        : True,
     'rel_rank'              : 8,
     # Training
-    'batch_size'            : 64,
-    'gradient_accumulation' : 2,
+    'batch_size'            : 128,
+    'gradient_accumulation' : 1,
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
     'weight_decay'          : 0.1,
@@ -75,7 +75,7 @@ CONFIG = {
     'adam_beta2'            : 0.95,
     'adam_eps'              : 1e-8,
     'num_epochs'            : 1,             # 1 chunk par epoch = 4B tokens total
-    'chunks_per_epoch'      : 4,
+    'chunks_per_epoch'      : 2,
     # Data
     'data_dir'              : './data_exp',
     'val_tokens'            : 10_000_000,    # 10M tokens validation par chunk
