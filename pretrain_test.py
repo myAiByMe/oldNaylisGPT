@@ -165,7 +165,7 @@ def download_model_from_hf():
         from huggingface_hub import list_repo_files
         remote_files = list(list_repo_files(
             repo_id   = HF_MODEL_REPO,
-            repo_type = 'model',
+            repo_type = 'dataset',
             token     = HF_TOKEN,
         ))
         # On cherche le fichier .pt principal
