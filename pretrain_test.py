@@ -165,7 +165,7 @@ def download_model_from_hf():
         from huggingface_hub import list_repo_files
         remote_files = list(list_repo_files(
             repo_id   = HF_MODEL_REPO,
-            repo_type = 'model',
+            repo_type = 'dataset',
             token     = HF_TOKEN,
         ))
         # On cherche le fichier .pt principal
@@ -190,7 +190,7 @@ def download_model_from_hf():
                 hf_hub_download(
                     repo_id   = HF_MODEL_REPO,
                     filename  = fname,
-                    repo_type = 'model',
+                    repo_type = 'dataset',
                     token     = HF_TOKEN,
                     local_dir = dest_dir,
                 )
@@ -226,7 +226,7 @@ def upload_model_to_hf(force: bool = False):
             HF_API.upload_folder(
                 folder_path    = model_dir,
                 repo_id        = HF_MODEL_REPO,
-                repo_type      = 'model',
+                repo_type = 'dataset',
                 path_in_repo   = 'Model',
                 commit_message = 'auto-sync step (background)',
                 token          = HF_TOKEN,
@@ -235,7 +235,7 @@ def upload_model_to_hf(force: bool = False):
                 HF_API.upload_folder(
                     folder_path    = compile_dir,
                     repo_id        = HF_MODEL_REPO,
-                    repo_type      = 'model',
+                    repo_type = 'dataset',
                     path_in_repo   = 'CompileCache',
                     commit_message = 'auto-sync CompileCache (background)',
                     token          = HF_TOKEN,
