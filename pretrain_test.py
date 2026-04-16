@@ -51,8 +51,8 @@ ARGS   = get_args()
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # ── Hugging Face ──────────────────────────────────────────────────────────────
-HF_DATASET_REPO          = "silyan/data_PoC"       # lecture data
-HF_MODEL_REPO            = "silyan/testOldScript"  # écriture modèle + cache
+HF_DATASET_REPO          = "silyan/data_PoC"
+HF_MODEL_REPO            = "silyan/testOldScript"
 HF_TOKEN                 = ARGS.HF_token
 HF_TIMED_SAVE_EVERY_MIN  = 60
 
@@ -91,13 +91,15 @@ CONFIG = {
     'adam_beta1'            : 0.9,
     'adam_beta2'            : 0.95,
     'adam_eps'              : 1e-8,
+    'num_epochs'            : 1,
+    'chunks_per_epoch'      : 2,
     # Data
     'data_dir'              : './data_exp',
     'val_tokens'            : 10_000_000,
     'warmup_ratio'          : 0.03,
     'decay_ratio'           : 0.15,
     'min_lr_ratio'          : 0.1,
-    # Validation / Save
+    # Validation
     'validate_every_steps'  : 500,
     'val_batches'           : 50,
     'save_every_steps'      : 2000,
@@ -120,8 +122,7 @@ if DEVICE == 'cuda':
     cap = torch.cuda.get_device_capability()
     print(f'  SM   : {cap[0]}{cap[1]}')
 print(f'  embed={CONFIG["embed_dim"]}  layers={CONFIG["num_layers"]}  '
-      f'heads={CONFIG["num_heads"]}  kv={CONFIG["n_kv_heads"]}  rel_rank={CONFIG["rel_rank"]}  '
-      f'batch_size={CONFIG["batch_size"]}  grad_acc={CONFIG["gradient_accumulation"]}')
+      f'heads={CONFIG["num_heads"]}  kv={CONFIG["n_kv_heads"]}  rel_rank={CONFIG["rel_rank"]}')
 
 
 # ── Tokenizer ────────────────────────────────────────────────────────────────
@@ -146,27 +147,30 @@ def hf_list_files(repo_id: str, repo_type: str = "dataset") -> list:
 
 
 def hf_check_and_download_data(data_dir: str):
-    """Si data_dir ne contient pas de chunks, télécharge depuis HF_DATASET_REPO."""
-    from huggingface_hub import snapshot_download
-    existing = [e for e in os.listdir(data_dir)
-                if os.path.isdir(os.path.join(data_dir, e)) and e.startswith('chunk')]
-    if existing:
-        print(f'  ✅ Data déjà présente : {len(existing)} chunk(s) dans {data_dir}')
+    """Si chunk_000 absent de data_dir, télécharge uniquement chunk_000 depuis HF_DATASET_REPO."""
+    from huggingface_hub import hf_hub_download
+    chunk_000_dir = os.path.join(data_dir, 'chunk_000')
+    chunk_000_npy = os.path.join(chunk_000_dir, 'tokens.npy')
+
+    if os.path.exists(chunk_000_npy):
+        print(f'  ✅ chunk_000 déjà présent : {chunk_000_npy}')
         return
+
     print(f'\n{"="*70}')
-    print(f'  📥 DATA ABSENTE — téléchargement depuis {HF_DATASET_REPO}')
+    print(f'  📥 chunk_000 ABSENT — téléchargement depuis {HF_DATASET_REPO}')
     print(f'{"="*70}')
+    os.makedirs(chunk_000_dir, exist_ok=True)
     try:
-        snapshot_download(
-            repo_id        = HF_DATASET_REPO,
-            repo_type      = "dataset",
-            local_dir      = data_dir,
-            token          = HF_TOKEN,
-            ignore_patterns= ["*.md", "*.gitattributes"],
+        hf_hub_download(
+            repo_id   = HF_DATASET_REPO,
+            filename  = 'chunk_000/tokens.npy',
+            repo_type = "dataset",
+            token     = HF_TOKEN,
+            local_dir = data_dir,
         )
-        print(f'  ✅ Dataset téléchargé dans {data_dir}')
+        print(f'  ✅ chunk_000/tokens.npy téléchargé dans {data_dir}')
     except Exception as e:
-        print(f'  ❌ Échec téléchargement dataset : {e}')
+        print(f'  ❌ Échec téléchargement chunk_000 : {e}')
         sys.exit(1)
 
 
@@ -202,10 +206,7 @@ def hf_check_and_download_checkpoint(ckpt_path: str):
 
 
 def hf_download_compile_cache():
-    """
-    Télécharge CompileCache.zip depuis HF_MODEL_REPO et le dézippe localement.
-    Appelé une seule fois au démarrage.
-    """
+    """Télécharge CompileCache.zip depuis HF_MODEL_REPO et le dézippe localement."""
     from huggingface_hub import hf_hub_download
     remote_files = hf_list_files(HF_MODEL_REPO)
     if COMPILE_CACHE_ZIP not in remote_files:
@@ -245,10 +246,7 @@ def _zip_compile_cache() -> Optional[str]:
 
 
 def hf_push_checkpoint(ckpt_path: str, global_step: int, push_cache: bool = True):
-    """
-    Pousse le checkpoint + _info.json + CompileCache.zip vers HF_MODEL_REPO.
-    Appelé en thread daemon pour ne pas bloquer le training.
-    """
+    """Pousse le checkpoint + _info.json + CompileCache.zip vers HF_MODEL_REPO."""
     if HF_TOKEN is None:
         return
     from huggingface_hub import upload_file
@@ -261,7 +259,6 @@ def hf_push_checkpoint(ckpt_path: str, global_step: int, push_cache: bool = True
     if os.path.exists(info_path):
         files_to_push.append((info_path, info_filename))
 
-    # Zip du CompileCache
     if push_cache:
         zip_path = _zip_compile_cache()
         if zip_path:
@@ -332,8 +329,6 @@ def scan_chunks(data_dir: str) -> list:
         if not os.path.isdir(chunk_dir) or not entry.startswith('chunk'):
             continue
         npy_file = os.path.join(chunk_dir, 'tokens.npy')
-        if not os.path.exists(npy_file):
-            npy_file = os.path.join(chunk_dir, 'cosmopedia.npy')
         if not os.path.exists(npy_file):
             continue
         try:
@@ -406,6 +401,7 @@ class WSDScheduler:
 
 # ── Datasets ─────────────────────────────────────────────────────────────────
 class ChunkDataset(Dataset):
+    """Dataset standard — pas de packing."""
     def __init__(self, tokens: torch.Tensor, seq_len: int):
         n = len(tokens) // (seq_len + 1)
         self.tokens  = tokens[:n * (seq_len + 1)].share_memory_()
@@ -421,6 +417,7 @@ class ChunkDataset(Dataset):
 
 
 class PackedChunkDataset(Dataset):
+    """Sequence packing — 0% padding."""
     def __init__(self, tokens: torch.Tensor, seq_len: int, eos_token_id: int):
         n = len(tokens) // (seq_len + 1)
         self.tokens       = tokens[:n * (seq_len + 1)].share_memory_()
@@ -458,6 +455,7 @@ def packed_collate_fn(batch, eos_token_id: int, seq_len: int):
 
 
 class LazyChunk:
+    """Charge un chunk .npy — RAM directe si possible, mmap sinon."""
     def __init__(self, chunk_info: dict, seq_len: int, val_tokens: int):
         print(f'  Chargement chunk_{chunk_info["id"]:03d}...')
         t0 = time.time()
@@ -528,8 +526,7 @@ class CheckpointManager:
         torch.save(cp, tmp_pt)
         os.replace(tmp_pt, self.path)
         os.replace(tmp_json, info_path)
-        print(f'  💾 SAVE  step={metadata["global_step"]:,}  '
-              f'chunk_idx={metadata["current_chunk_idx"]}  [{self.path}]')
+        print(f'  💾 SAVE  step={metadata["global_step"]:,}  [{self.path}]')
 
     def load(self) -> Optional[dict]:
         if not os.path.exists(self.path):
@@ -824,10 +821,8 @@ def train_one_chunk(
                     scales = [b.attention.graph_scale.detach().abs().mean().item()
                               for b in raw.blocks]
                     avg_s  = sum(scales) / len(scales)
-                    g_min  = min(scales); g_max = max(scales)
                     pbar.write(f'  [naylis step={global_step:,}] '
-                               f'|graph_scale| avg={avg_s:.5f}  '
-                               f'min={g_min:.5f}  max={g_max:.5f}')
+                               f'|graph_scale| avg={avg_s:.5f}')
 
         except torch.cuda.OutOfMemoryError:
             print(f'\n  OOM — skip batch')
