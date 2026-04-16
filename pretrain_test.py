@@ -153,72 +153,50 @@ def download_data_chunk():
         print(f'  WARN : impossible de télécharger chunk_000 : {e}')
 
 
-# ── HF : télécharge le dossier Model + CompileCache.zip si présents ──────────
+# ── HF : télécharge le dossier Model si présent dans le repo ─────────────────
 def download_model_from_hf():
     """Si le repo HF contient déjà un checkpoint, on le récupère localement."""
-    import zipfile
     if not HF_TOKEN:
         return
-    model_dir   = os.path.dirname(CONFIG['checkpoint_file'])
-    compile_dir = './CompileCache'
+    model_dir = os.path.dirname(CONFIG['checkpoint_file'])
     os.makedirs(model_dir, exist_ok=True)
     print(f'\n  Vérification checkpoint distant ({HF_MODEL_REPO})...')
     try:
-        from huggingface_hub import list_repo_files, hf_hub_download
+        from huggingface_hub import list_repo_files
         remote_files = list(list_repo_files(
             repo_id   = HF_MODEL_REPO,
             repo_type = 'dataset',
             token     = HF_TOKEN,
         ))
-        # ── Checkpoint .pt ────────────────────────────────────────────────────
+        # On cherche le fichier .pt principal
         pt_files = [f for f in remote_files if f.endswith('.pt')]
         if not pt_files:
             print('  Aucun checkpoint distant trouvé — démarrage from scratch')
-        else:
-            print(f'  Fichiers distants trouvés : {pt_files}')
-            for fname in remote_files:
-                if fname == 'CompileCache.zip':
-                    continue   # traité séparément ci-dessous
-                local_path = os.path.join(model_dir, os.path.basename(fname))
-                if os.path.exists(local_path):
-                    continue
-                try:
-                    hf_hub_download(
-                        repo_id   = HF_MODEL_REPO,
-                        filename  = fname,
-                        repo_type = 'dataset',
-                        token     = HF_TOKEN,
-                        local_dir = model_dir,
-                    )
-                    print(f'  ✅ {fname} téléchargé')
-                except Exception as e:
-                    print(f'  WARN : impossible de télécharger {fname} : {e}')
-
-        # ── CompileCache.zip ──────────────────────────────────────────────────
-        if 'CompileCache.zip' in remote_files:
-            zip_local = './CompileCache.zip'
-            if not os.path.exists(compile_dir):
-                print('  Téléchargement CompileCache.zip...')
-                try:
-                    hf_hub_download(
-                        repo_id   = HF_MODEL_REPO,
-                        filename  = 'CompileCache.zip',
-                        repo_type = 'dataset',
-                        token     = HF_TOKEN,
-                        local_dir = '.',
-                    )
-                    print('  Décompression CompileCache.zip...')
-                    with zipfile.ZipFile(zip_local, 'r') as zf:
-                        zf.extractall('.')
-                    os.remove(zip_local)
-                    print(f'  ✅ CompileCache restauré → {compile_dir}')
-                except Exception as e:
-                    print(f'  WARN : impossible de restaurer CompileCache : {e}')
+            return
+        print(f'  Fichiers distants trouvés : {pt_files}')
+        from huggingface_hub import hf_hub_download
+        for fname in remote_files:
+            # CompileCache/ → on restore dans ./ pour réutiliser le cache inductor
+            if fname.startswith('CompileCache/'):
+                local_path = os.path.join('.', fname)
+                dest_dir   = '.'
             else:
-                print('  CompileCache déjà présent localement — skip download')
-        else:
-            print('  Aucun CompileCache.zip distant — sera créé à la première compile')
-
+                # Tous les autres fichiers (Model/) → dossier checkpoint
+                local_path = os.path.join(model_dir, os.path.basename(fname))
+                dest_dir   = model_dir
+            if os.path.exists(local_path):
+                continue
+            try:
+                hf_hub_download(
+                    repo_id   = HF_MODEL_REPO,
+                    filename  = fname,
+                    repo_type = 'dataset',
+                    token     = HF_TOKEN,
+                    local_dir = dest_dir,
+                )
+                print(f'  ✅ {fname} téléchargé')
+            except Exception as e:
+                print(f'  WARN : impossible de télécharger {fname} : {e}')
     except Exception as e:
         print(f'  WARN : vérification HF échouée : {e}')
 
@@ -239,41 +217,30 @@ def upload_model_to_hf(force: bool = False):
         _last_hf_upload = now
 
     def _do_upload():
-        import zipfile, shutil
-        model_dir   = os.path.dirname(CONFIG['checkpoint_file'])
-        compile_dir = './CompileCache'
+        model_dir    = os.path.dirname(CONFIG['checkpoint_file'])
+        compile_dir  = './CompileCache'
         if not os.path.exists(model_dir):
             return
         try:
-            print(f'\n  ☁️  Upload HF → {HF_MODEL_REPO} (Model + CompileCache.zip)...')
+            print(f'\n  ☁️  Upload HF → {HF_MODEL_REPO} (Model + CompileCache)...')
             HF_API.upload_folder(
                 folder_path    = model_dir,
                 repo_id        = HF_MODEL_REPO,
-                repo_type      = 'dataset',
+                repo_type = 'dataset',
                 path_in_repo   = 'Model',
                 commit_message = 'auto-sync step (background)',
                 token          = HF_TOKEN,
             )
-            # CompileCache → zip puis upload fichier unique
             if os.path.exists(compile_dir) and os.listdir(compile_dir):
-                zip_path = './CompileCache.zip'
-                print('  Compression CompileCache → CompileCache.zip...')
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for root, dirs, files in os.walk(compile_dir):
-                        for file in files:
-                            abs_path = os.path.join(root, file)
-                            arc_name = os.path.relpath(abs_path, '.')
-                            zf.write(abs_path, arc_name)
-                HF_API.upload_file(
-                    path_or_fileobj = zip_path,
-                    path_in_repo    = 'CompileCache.zip',
-                    repo_id         = HF_MODEL_REPO,
-                    repo_type       = 'dataset',
-                    commit_message  = 'auto-sync CompileCache.zip (background)',
-                    token           = HF_TOKEN,
+                HF_API.upload_folder(
+                    folder_path    = compile_dir,
+                    repo_id        = HF_MODEL_REPO,
+                    repo_type = 'dataset',
+                    path_in_repo   = 'CompileCache',
+                    commit_message = 'auto-sync CompileCache (background)',
+                    token          = HF_TOKEN,
                 )
-                os.remove(zip_path)
-                print(f'  ✅ Upload HF terminé (Model + CompileCache.zip)')
+                print(f'  ✅ Upload HF terminé (Model + CompileCache)')
             else:
                 print(f'  ✅ Upload HF terminé (Model)')
         except Exception as e:
