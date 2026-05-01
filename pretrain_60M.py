@@ -21,9 +21,14 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from typing import Optional, List
 
+import matplotlib
+matplotlib.use('Agg')  # pas de display, sauvegarde en fichier
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+
 torch.set_float32_matmul_precision('high')
 
-# ── Paths Core ───────────────────────────────────────────────────────────────
+# -- Paths Core -----------------------------------------------------------------
 _root = os.path.dirname(__file__)
 sys.path.append(os.path.join(_root, 'Core', 'Model'))
 sys.path.append(os.path.join(_root, 'Core', 'Attention'))
@@ -33,7 +38,7 @@ sys.path.append(os.path.join(_root, 'Core', 'TransformerBlock'))
 from HessGpt import NaylisGPT
 from attention import KVCache
 
-# ── Args ─────────────────────────────────────────────────────────────────────
+# -- Args -----------------------------------------------------------------------
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument('--no-compile',   action='store_true')
@@ -44,27 +49,27 @@ def get_args():
 ARGS   = get_args()
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# -- Config ---------------------------------------------------------------------
 CONFIG = {
-    # Modèle
-    'vocab_size'            : None,           # rempli après tokenizer
+    # Model
+    'vocab_size'            : None,
     'embed_dim'             : 512,
     'num_heads'             : 8,
-    'num_layers'            : 8,
-    'max_seq_len'           : 512,    # pretrain 512 → SFT YaRN×2 = 1024
+    'num_layers'            : 12,
+    'max_seq_len'           : 512,
     'dropout'               : 0.0,
     'use_rope'              : True,
     'use_yarn'              : False,
     'yarn_scale'            : 1.0,
-    'yarn_original_max_len' : 512,    # référence pour YaRN en SFT
+    'yarn_original_max_len' : 512,
     'use_swiglu'            : True,
     'n_kv_heads'            : 4,
     'use_qk_norm'           : True,
     'soft_cap'              : None,
     'use_flash_attn'        : True,
-    'rel_rank'              : 16,
+    'rel_rank'              : 32,
     # Training
-    'batch_size'            : 128,
+    'batch_size'            : 210,
     'gradient_accumulation' : 1,
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
@@ -73,8 +78,8 @@ CONFIG = {
     'adam_beta2'            : 0.95,
     'adam_eps'              : 1e-8,
     # Data
-    'data_file'             : './data/pretrain_data_3B.bin',   # fichier shufflé/mergé
-    'val_tokens'            : 10_000_000,    # 10M tokens réservés pour la validation
+    'data_file'             : './data/pretrain_data_3B.bin',
+    'val_tokens'            : 10_000_000,
     'warmup_ratio'          : 0.03,
     'decay_ratio'           : 0.15,
     'min_lr_ratio'          : 0.1,
@@ -90,10 +95,12 @@ CONFIG = {
     # DataLoader
     'num_workers'           : 1,
     'use_packing'           : True,
+    # Plot
+    'plot_file'             : './Model/training_curves.png',
 }
 
 print('=' * 70)
-print('  Naylis v1 — Pretrain')
+print('  Naylis v1 -- Pretrain')
 print('=' * 70)
 if DEVICE == 'cuda':
     print(f'  GPU  : {torch.cuda.get_device_name(0)}')
@@ -104,7 +111,7 @@ print(f'  embed={CONFIG["embed_dim"]}  layers={CONFIG["num_layers"]}  '
       f'heads={CONFIG["num_heads"]}  kv={CONFIG["n_kv_heads"]}  rel_rank={CONFIG["rel_rank"]}')
 
 
-# ── Tokenizer ────────────────────────────────────────────────────────────────
+# -- Tokenizer ------------------------------------------------------------------
 print('\nTokenizer...')
 tokenizer = AutoTokenizer.from_pretrained('HuggingFaceTB/cosmo2-tokenizer')
 if tokenizer.pad_token is None:
@@ -113,13 +120,13 @@ CONFIG['vocab_size'] = len(tokenizer)
 print(f'  vocab={len(tokenizer)}  eos={tokenizer.eos_token_id}')
 
 
-# ── Data — 1 fichier mmap ─────────────────────────────────────────────────────
+# -- Data -----------------------------------------------------------------------
 _data_path = Path(CONFIG['data_file'])
 if not _data_path.exists():
-    print(f'\nERREUR : fichier introuvable → {_data_path}')
+    print(f'\nERREUR : fichier introuvable -> {_data_path}')
     sys.exit(1)
 
-_n_tokens   = _data_path.stat().st_size // 2          # uint16 = 2 bytes
+_n_tokens   = _data_path.stat().st_size // 2
 _val_size   = min(CONFIG['val_tokens'], int(_n_tokens * 0.05))
 _train_size = _n_tokens - _val_size
 
@@ -136,7 +143,121 @@ print(f'  Val      : {_val_size / 1e6:.0f}M tokens')
 print(f'  Steps    : {TOTAL_STEPS:,}')
 
 
-# ── WSD Scheduler ────────────────────────────────────────────────────────────
+# -- Live Plot ------------------------------------------------------------------
+
+class LivePlot:
+    """
+    Sauvegarde un PNG a chaque update avec deux subplots :
+      - haut  : train loss (gris) + val loss (bleu)
+      - bas   : graph_scale moyen (orange)
+    """
+    def __init__(self, path: str, total_steps: int):
+        self.path         = path
+        self.total_steps  = total_steps
+        self.train_steps  : list[int]   = []
+        self.train_losses : list[float] = []
+        self.val_steps    : list[int]   = []
+        self.val_losses   : list[float] = []
+        self.gs_steps     : list[int]   = []
+        self.gs_values    : list[float] = []
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+
+    def add_train(self, step: int, loss: float):
+        self.train_steps.append(step)
+        self.train_losses.append(loss)
+
+    def add_val(self, step: int, loss: float):
+        self.val_steps.append(step)
+        self.val_losses.append(loss)
+
+    def add_graph_scale(self, step: int, value: float):
+        self.gs_steps.append(step)
+        self.gs_values.append(value)
+
+    def save(self):
+        fig = plt.figure(figsize=(14, 8), facecolor='#0d1117')
+        gs  = gridspec.GridSpec(2, 1, figure=fig, hspace=0.45)
+
+        ax_loss = fig.add_subplot(gs[0])
+        ax_gs   = fig.add_subplot(gs[1])
+
+        for ax in (ax_loss, ax_gs):
+            ax.set_facecolor('#161b22')
+            ax.tick_params(colors='#8b949e')
+            ax.xaxis.label.set_color('#8b949e')
+            ax.yaxis.label.set_color('#8b949e')
+            ax.title.set_color('#c9d1d9')
+            for spine in ax.spines.values():
+                spine.set_edgecolor('#30363d')
+
+        # --- Loss ---
+        if self.train_steps:
+            ax_loss.plot(self.train_steps, self.train_losses,
+                         color='#484f58', linewidth=0.8, alpha=0.7, label='Train loss')
+        if self.val_steps:
+            ax_loss.plot(self.val_steps, self.val_losses,
+                         color='#58a6ff', linewidth=1.8, marker='o',
+                         markersize=4, label='Val loss')
+        ax_loss.set_title('Loss', fontsize=13, fontweight='bold')
+        ax_loss.set_xlabel('Step')
+        ax_loss.set_ylabel('Loss')
+        ax_loss.set_xlim(0, self.total_steps)
+        if self.train_losses:
+            ymin = min(min(self.train_losses), min(self.val_losses, default=999)) * 0.95
+            ymax = max(max(self.train_losses[:20] if len(self.train_losses) > 20
+                           else self.train_losses), 0.1) * 1.05
+            ax_loss.set_ylim(max(ymin, 0), ymax)
+        ax_loss.legend(facecolor='#161b22', edgecolor='#30363d',
+                       labelcolor='#c9d1d9', fontsize=9)
+        ax_loss.grid(True, color='#21262d', linewidth=0.5)
+
+        # Annotation dernier val loss
+        if self.val_steps:
+            last_s, last_l = self.val_steps[-1], self.val_losses[-1]
+            ax_loss.annotate(
+                f'{last_l:.4f}',
+                xy=(last_s, last_l),
+                xytext=(8, 8), textcoords='offset points',
+                color='#58a6ff', fontsize=8,
+                arrowprops=dict(arrowstyle='->', color='#58a6ff', lw=0.8),
+            )
+
+        # --- Graph Scale ---
+        if self.gs_steps:
+            ax_gs.plot(self.gs_steps, self.gs_values,
+                       color='#e3b341', linewidth=1.5, marker='s',
+                       markersize=4, label='|graph_scale| avg')
+            ax_gs.fill_between(self.gs_steps, self.gs_values,
+                               alpha=0.15, color='#e3b341')
+        ax_gs.set_title('Naylis Graph Scale', fontsize=13, fontweight='bold')
+        ax_gs.set_xlabel('Step')
+        ax_gs.set_ylabel('|graph_scale| avg')
+        ax_gs.set_xlim(0, self.total_steps)
+        ax_gs.legend(facecolor='#161b22', edgecolor='#30363d',
+                     labelcolor='#c9d1d9', fontsize=9)
+        ax_gs.grid(True, color='#21262d', linewidth=0.5)
+
+        if self.gs_values:
+            last_s, last_v = self.gs_steps[-1], self.gs_values[-1]
+            ax_gs.annotate(
+                f'{last_v:.5f}',
+                xy=(last_s, last_v),
+                xytext=(8, 8), textcoords='offset points',
+                color='#e3b341', fontsize=8,
+                arrowprops=dict(arrowstyle='->', color='#e3b341', lw=0.8),
+            )
+
+        fig.suptitle(
+            f'Naylis Pretrain  —  {self.total_steps:,} steps',
+            color='#c9d1d9', fontsize=15, fontweight='bold', y=0.98,
+        )
+
+        plt.savefig(self.path, dpi=130, bbox_inches='tight',
+                    facecolor=fig.get_facecolor())
+        plt.close(fig)
+
+
+# -- WSD Scheduler --------------------------------------------------------------
 class WSDScheduler:
     def __init__(self, optimizers, max_lr, total_steps,
                  warmup_ratio=0.03, decay_ratio=0.15, min_lr_ratio=0.1):
@@ -173,41 +294,33 @@ class WSDScheduler:
     def load_state_dict(self, sd): self.current_step = sd['current_step']
 
 
-# ── MmapData : charge pretrain_data.bin en mmap (0 RAM) ──────────────────────
+# -- MmapData -------------------------------------------------------------------
 class MmapData:
-    """
-    Ouvre pretrain_data.bin en np.memmap (uint16) — aucune copie en RAM.
-    Split train / val sur les _n_tokens déjà calculés.
-    """
     def __init__(self):
-        print(f'  mmap → {_data_path}')
+        print(f'  mmap -> {_data_path}')
         t0  = time.time()
         arr = np.memmap(str(_data_path), dtype=np.uint16, mode='r', shape=(_n_tokens,))
-
-        # Conversion int32 en vue, toujours en mmap (pas de copie)
-        # On garde numpy uint16 et on cast dans __getitem__ pour économiser la RAM
         self._arr       = arr
         self._train_end = _train_size
         print(f'  mmap OK  train={_train_size/1e9:.3f}B  val={_val_size/1e6:.0f}M  '
               f'({time.time()-t0:.1f}s)')
 
-    def train_dataset(self, seq_len: int, use_packing: bool, eos_id: int):
+    def train_dataset(self, seq_len, use_packing, eos_id):
         if use_packing:
             return MmapPackedDataset(self._arr[:self._train_end], seq_len, eos_id)
         return MmapDataset(self._arr[:self._train_end], seq_len)
 
-    def val_dataset(self, seq_len: int):
+    def val_dataset(self, seq_len):
         return MmapDataset(self._arr[self._train_end:], seq_len)
 
     def unload(self):
         del self._arr
         gc.collect()
-        print('  mmap libéré')
+        print('  mmap libere')
 
 
 class MmapDataset(Dataset):
-    """Dataset standard sur slice mmap — pas de packing."""
-    def __init__(self, arr, seq_len: int):
+    def __init__(self, arr, seq_len):
         n            = len(arr) // (seq_len + 1)
         self._arr    = arr[:n * (seq_len + 1)]
         self.seq_len = seq_len
@@ -222,8 +335,7 @@ class MmapDataset(Dataset):
 
 
 class MmapPackedDataset(Dataset):
-    """Sequence packing sur slice mmap — 0% padding."""
-    def __init__(self, arr, seq_len: int, eos_token_id: int):
+    def __init__(self, arr, seq_len, eos_token_id):
         n                 = len(arr) // (seq_len + 1)
         self._arr         = arr[:n * (seq_len + 1)]
         self.seq_len      = seq_len
@@ -238,7 +350,7 @@ class MmapPackedDataset(Dataset):
         return b[:-1].clone(), b[1:].clone()
 
 
-def packed_collate_fn(batch, eos_token_id: int, seq_len: int):
+def packed_collate_fn(batch, eos_token_id, seq_len):
     xs, ys = zip(*batch)
     x = torch.stack(xs)
     y = torch.stack(ys)
@@ -259,15 +371,14 @@ def packed_collate_fn(batch, eos_token_id: int, seq_len: int):
     return x, y, torch.tensor(all_cu, dtype=torch.int32), max_sl
 
 
-
-# ── Checkpoint ───────────────────────────────────────────────────────────────
+# -- Checkpoint -----------------------------------------------------------------
 class CheckpointManager:
-    def __init__(self, path: str):
+    def __init__(self, path):
         self.path = path
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
 
-    def save(self, model, optimizers, scheduler, metadata: dict):
-        m         = model._orig_mod if hasattr(model, '_orig_mod') else model
+    def save(self, model, optimizers, scheduler, metadata):
+        m           = model._orig_mod if hasattr(model, '_orig_mod') else model
         muon, adamw = optimizers
         cp = {
             'model_state_dict'    : m.state_dict(),
@@ -276,24 +387,24 @@ class CheckpointManager:
             'scheduler_state_dict': scheduler.state_dict(),
         }
         info_path = self.path.replace('.pt', '_info.json')
-        info = {**metadata, 'last_save': datetime.now().isoformat(), 'config': CONFIG}
-        tmp_json = info_path + '.tmp'
+        info      = {**metadata, 'last_save': datetime.now().isoformat(), 'config': CONFIG}
+        tmp_json  = info_path + '.tmp'
         with open(tmp_json, 'w') as f:
             json.dump(info, f, indent=2, default=str)
         tmp_pt = self.path + '.tmp'
         torch.save(cp, tmp_pt)
         os.replace(tmp_pt, self.path)
         os.replace(tmp_json, info_path)
-        print(f'  💾 SAVE  step={metadata["global_step"]:,}  [{self.path}]')
+        print(f'  SAVE  step={metadata["global_step"]:,}  [{self.path}]')
 
-    def load(self) -> Optional[dict]:
+    def load(self):
         if not os.path.exists(self.path):
             return None
-        print(f'\nCheckpoint trouvé : {self.path}')
+        print(f'\nCheckpoint trouve : {self.path}')
         cp        = torch.load(self.path, map_location='cpu', weights_only=False)
         info_path = self.path.replace('.pt', '_info.json')
         if os.path.exists(info_path):
-            with open(info_path, 'r') as f:
+            with open(info_path) as f:
                 info = json.load(f)
             for k in ('global_step', 'current_epoch', 'chunk_within_epoch',
                       'total_training_time', 'chunk_start_step'):
@@ -305,9 +416,9 @@ class CheckpointManager:
         return cp
 
 
-# ── Validation ───────────────────────────────────────────────────────────────
+# -- Validation -----------------------------------------------------------------
 @torch.no_grad()
-def validate(model, val_loader, max_batches: int = 50) -> tuple:
+def validate(model, val_loader, max_batches=50):
     model.eval()
     total_loss, n = 0.0, 0
     ae  = (DEVICE == 'cuda')
@@ -325,8 +436,8 @@ def validate(model, val_loader, max_batches: int = 50) -> tuple:
     return math.exp(min(avg, 10)), avg
 
 
-# ── Muon + MARS-M ─────────────────────────────────────────────────────────────
-def _zeropower_via_newtonschulz5(G, steps: int = 5):
+# -- Muon + MARS ----------------------------------------------------------------
+def _zeropower_via_newtonschulz5(G, steps=5):
     assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16() / (G.norm() + 1e-7)
@@ -374,7 +485,7 @@ class Muon(torch.optim.Optimizer):
                 p.add_(g, alpha=-lr)
 
 
-def configure_optimizers(model, lr: float, weight_decay: float, betas, eps):
+def configure_optimizers(model, lr, weight_decay, betas, eps):
     EXCLUDE = {'token_embeddings.weight', 'output_head.weight'}
     muon_params, adamw_decay, adamw_nodecay = [], [], []
     for pn, p in model.named_parameters():
@@ -409,20 +520,18 @@ def configure_optimizers(model, lr: float, weight_decay: float, betas, eps):
     return muon_opt, adamw_opt
 
 
-# ── Train one pass ────────────────────────────────────────────────────────────
+# -- Train one pass -------------------------------------------------------------
 def train_one_pass(
-    model, data: MmapData, optimizers, scheduler,
-    ckpt_mgr: CheckpointManager, history: dict,
-    global_step: int, total_time: float,
-    start_step: int,
-) -> tuple:
-
+    model, data, optimizers, scheduler,
+    ckpt_mgr, history, plot,
+    global_step, total_time, start_step,
+):
     muon_opt, adamw_opt = optimizers
     steps_done   = global_step - start_step
     batches_done = steps_done * CONFIG['gradient_accumulation']
 
     print(f'\n{"="*70}')
-    print(f'  TRAINING  —  {TOTAL_STEPS:,} steps  |  {_train_size/1e9:.3f}B tokens')
+    print(f'  TRAINING  --  {TOTAL_STEPS:,} steps  |  {_train_size/1e9:.3f}B tokens')
     print(f'{"="*70}')
 
     train_ds = data.train_dataset(
@@ -431,11 +540,10 @@ def train_one_pass(
 
     total_seqs = len(train_ds)
     if batches_done >= math.ceil(total_seqs / CONFIG['batch_size']):
-        print('  ✅ Pass déjà terminée — skip')
+        print('  Pass deja terminee -- skip')
         data.unload()
         return global_step, total_time, start_step
 
-    # Sampler séquentiel (les données sont déjà shufflées dans le .bin)
     indices = list(range(batches_done * CONFIG['batch_size'], total_seqs))
 
     class IndexSampler(torch.utils.data.Sampler):
@@ -466,7 +574,8 @@ def train_one_pass(
           f'packing={"ON" if CONFIG["use_packing"] else "OFF"}')
 
     model.train()
-    ae, adt       = (DEVICE == 'cuda'), torch.bfloat16
+    ae            = (DEVICE == 'cuda')
+    adt           = torch.bfloat16
     run_loss      = 0.0
     valid_batches = 0
     acc_steps     = 0
@@ -489,7 +598,7 @@ def train_one_pass(
                 x, y       = batch[0].to(DEVICE), batch[1].to(DEVICE)
                 cu_seqlens = max_sl = None
 
-            with torch.amp.autocast(DEVICE, dtype=adt, enabled=(DEVICE == 'cuda')):
+            with torch.amp.autocast(DEVICE, dtype=adt, enabled=ae):
                 _, loss, _ = model(
                     x, targets=y,
                     cu_seqlens_q = cu_seqlens,
@@ -511,8 +620,7 @@ def train_one_pass(
             acc_steps     += 1
 
             if acc_steps >= CONFIG['gradient_accumulation']:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), CONFIG['max_grad_norm'])
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG['max_grad_norm'])
                 muon_opt.step()
                 adamw_opt.step()
                 lr = scheduler.step()
@@ -522,19 +630,22 @@ def train_one_pass(
                 global_step += 1
 
                 avg_loss = run_loss / max(valid_batches, 1)
+                plot.add_train(global_step, avg_loss)
+
                 pbar.set_postfix(
                     loss=f'{avg_loss:.4f}',
-                    ppl =f'{math.exp(min(avg_loss, 10)):.1f}',
                     lr  =f'{lr:.2e}',
                 )
 
                 # Validation
                 if global_step % CONFIG['validate_every_steps'] == 0:
-                    ppl, vloss = validate(model, val_loader, CONFIG['val_batches'])
+                    _, vloss = validate(model, val_loader, CONFIG['val_batches'])
                     pbar.write(f'  [val  step={global_step:,}] '
-                               f'loss={vloss:.4f}  ppl={ppl:.2f}')
-                    history.setdefault('validations', []).append({
-                        'step': global_step, 'val_loss': vloss, 'val_ppl': ppl})
+                               f'loss={vloss:.4f}')
+                    history.setdefault('validations', []).append(
+                        {'step': global_step, 'val_loss': vloss})
+                    plot.add_val(global_step, vloss)
+                    plot.save()
 
                 # Checkpoint
                 if global_step % CONFIG['save_every_steps'] == 0:
@@ -544,17 +655,22 @@ def train_one_pass(
                         'start_step': start_step,
                     })
 
-                # graph_scale (signal Naylis)
-                if global_step % 1000 == 0:
-                    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
+                # Graph scale
+                if global_step % 1000 == 0 or global_step == 1:
+                    raw    = model._orig_mod if hasattr(model, '_orig_mod') else model
                     scales = [b.attention.graph_scale.detach().abs().mean().item()
                               for b in raw.blocks]
-                    avg_s = sum(scales) / len(scales)
+                    avg_s  = sum(scales) / len(scales)
                     pbar.write(f'  [naylis step={global_step:,}] '
                                f'|graph_scale| avg={avg_s:.5f}')
+                    plot.add_graph_scale(global_step, avg_s)
+
+                # Plot save every 500 steps
+                if global_step % 500 == 0 or global_step == 1:
+                    plot.save()
 
         except torch.cuda.OutOfMemoryError:
-            print(f'\n  OOM — skip batch')
+            print(f'\n  OOM -- skip batch')
             torch.cuda.empty_cache()
             muon_opt.zero_grad(set_to_none=True)
             adamw_opt.zero_grad(set_to_none=True)
@@ -567,11 +683,12 @@ def train_one_pass(
     elapsed     = time.time() - t0
     total_time += elapsed
     avg_loss    = run_loss / max(valid_batches, 1)
-    print(f'\n  Pass terminée | loss={avg_loss:.4f} | '
-          f'ppl={math.exp(min(avg_loss, 10)):.2f} | {elapsed / 60:.1f}min')
+    print(f'\n  Pass terminee | loss={avg_loss:.4f} | {elapsed / 60:.1f}min')
 
-    history.setdefault('passes', []).append({
-        'loss': avg_loss, 'time_sec': elapsed, 'global_step': global_step})
+    history.setdefault('passes', []).append(
+        {'loss': avg_loss, 'time_sec': elapsed, 'global_step': global_step})
+
+    plot.save()
 
     data.unload()
     del train_loader, val_loader
@@ -582,14 +699,14 @@ def train_one_pass(
     return global_step, total_time, start_step
 
 
-
-# ── Main ─────────────────────────────────────────────────────────────────────
+# -- Main -----------------------------------------------------------------------
 def main():
     print('\n' + '=' * 70)
-    print('  CRÉATION MODÈLE')
+    print('  CREATION MODELE')
     print('=' * 70)
 
     ckpt_mgr = CheckpointManager(CONFIG['checkpoint_file'])
+    plot     = LivePlot(CONFIG['plot_file'], TOTAL_STEPS)
 
     model = NaylisGPT(
         vocab_size            = CONFIG['vocab_size'],
@@ -625,7 +742,7 @@ def main():
         except Exception as e:
             print(f'  FAIL : {e}')
     else:
-        print('\ntorch.compile : désactivé')
+        print('\ntorch.compile : desactive')
 
     raw_model  = model._orig_mod if hasattr(model, '_orig_mod') else model
     optimizers = configure_optimizers(
@@ -640,10 +757,10 @@ def main():
         decay_ratio=CONFIG['decay_ratio'], min_lr_ratio=CONFIG['min_lr_ratio'],
     )
 
-    history      = {'config': CONFIG, 'passes': [], 'validations': []}
-    global_step  = 0
-    total_time   = 0.0
-    start_step   = 0
+    history     = {'config': CONFIG, 'passes': [], 'validations': []}
+    global_step = 0
+    total_time  = 0.0
+    start_step  = 0
 
     cp = ckpt_mgr.load()
     if cp:
@@ -657,11 +774,12 @@ def main():
         total_time  = cp.get('total_training_time', 0.0)
         start_step  = cp.get('start_step', 0)
         if global_step >= TOTAL_STEPS:
-            print('✅ Training déjà terminé.')
+            print('Training deja termine.')
             return
 
     print('\n' + '=' * 70)
-    print(f'  TRAINING START — {TOTAL_STEPS:,} steps')
+    print(f'  TRAINING START -- {TOTAL_STEPS:,} steps')
+    print(f'  Plot -> {CONFIG["plot_file"]}')
     print('=' * 70)
 
     data = MmapData()
@@ -669,7 +787,8 @@ def main():
     try:
         global_step, total_time, start_step = train_one_pass(
             model=model, data=data, optimizers=optimizers,
-            scheduler=scheduler, ckpt_mgr=ckpt_mgr, history=history,
+            scheduler=scheduler, ckpt_mgr=ckpt_mgr,
+            history=history, plot=plot,
             global_step=global_step, total_time=total_time,
             start_step=start_step,
         )
@@ -680,6 +799,7 @@ def main():
             'total_training_time': total_time,
             'start_step': start_step,
         })
+        plot.save()
         return
     except Exception:
         print(f'\n  ERREUR :\n{traceback.format_exc()}')
@@ -688,9 +808,10 @@ def main():
             'total_training_time': total_time,
             'start_step': start_step,
         })
+        plot.save()
         raise
 
-    print(f'\n{"="*70}\n  TRAINING TERMINÉ\n{"="*70}')
+    print(f'\n{"="*70}\n  TRAINING TERMINE\n{"="*70}')
     print(f'  Steps : {global_step:,}  |  Temps : {total_time / 3600:.2f}h')
 
     ckpt_mgr.save(model, optimizers, scheduler, {
@@ -702,8 +823,8 @@ def main():
     with open(hist_path, 'w') as f:
         json.dump(history, f, indent=2, default=str)
     print(f'  History : {hist_path}')
+    print(f'  Plot    : {CONFIG["plot_file"]}')
     print('  DONE')
-
 
 
 if __name__ == '__main__':
