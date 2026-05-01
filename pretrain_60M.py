@@ -88,7 +88,7 @@ CONFIG = {
     'val_batches'           : 50,
     'save_every_steps'      : 2000,
     # Checkpoint
-    'checkpoint_file'       : './Model/naylis_pretrain_116M.pt',
+    'checkpoint_file'       : './Model/naylis_pretrain_60M.pt',
     # Compile
     'use_compile'           : not ARGS.no_compile,
     'compile_mode'          : ARGS.compile_mode,
@@ -96,7 +96,7 @@ CONFIG = {
     'num_workers'           : 1,
     'use_packing'           : True,
     # Plot
-    'plot_file'             : './Model/training_curves.png',
+    'plot_file'             : './Model/training_curves_60M.png',
 }
 
 print('=' * 70)
