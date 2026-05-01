@@ -96,7 +96,7 @@ CONFIG = {
     'num_workers'           : 1,
     'use_packing'           : True,
     # Plot
-    'plot_file'             : './Model/training_curves.png',
+    'plot_file'             : './Model/training_curves_116M.png',
 }
 
 print('=' * 70)
