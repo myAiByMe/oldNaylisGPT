@@ -52,7 +52,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────
 TOKENIZER_ID       = "HuggingFaceTB/cosmo2-tokenizer"
 DEFAULT_MODEL_SFT  = "./Model/naylis_sft.pt"
-DEFAULT_MODEL_PRE  = "./Model/naylis_pretrain.pt"
+DEFAULT_MODEL_PRE  = "./Model/naylis_pretrain_60M.pt"
 
 MODEL_CFG = dict(
     vocab_size     = None,   # rempli au runtime depuis le tokenizer
@@ -61,7 +61,7 @@ MODEL_CFG = dict(
     num_layers     = 12,
     max_seq_len    = 512,   # CORRECTION 1 : était 512 → aligne sur le pretrain
     n_kv_heads     = 4,
-    rel_rank       = 8,
+    rel_rank       = 16,
     use_rope       = True,
     use_yarn       = False,
     use_swiglu     = True,
