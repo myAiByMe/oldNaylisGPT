@@ -67,9 +67,9 @@ CONFIG = {
     'use_qk_norm'           : True,
     'soft_cap'              : None,
     'use_flash_attn'        : True,
-    'rel_rank'              : 32,
+    'rel_rank'              : 16,
     # Training
-    'batch_size'            : 210,
+    'batch_size'            : 220,
     'gradient_accumulation' : 1,
     'max_grad_norm'         : 1.0,
     'learning_rate'         : 3e-4,
