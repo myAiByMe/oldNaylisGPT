@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 from functools import partial
 from datetime import datetime
 from pathlib import Path
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 from typing import Optional, List
 
