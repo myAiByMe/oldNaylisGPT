@@ -78,7 +78,7 @@ CONFIG = {
     'adam_beta2'            : 0.95,
     'adam_eps'              : 1e-8,
     # Data
-    'data_file'             : './data/pretrain_data_3B.bin',
+    'data_file'             : './data/pretrain_data.bin',
     'val_tokens'            : 10_000_000,
     'warmup_ratio'          : 0.03,
     'decay_ratio'           : 0.15,
